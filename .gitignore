@@ -1,0 +1,20 @@
+# 密钥及本地环境配置
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+# IDE和虚拟环境
+.idea/
+.vscode/
+.venv/
+venv/
+env/
+# Python和测试缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# 本地日志
+*.log
+.DS_Store
+Thumbs.db
