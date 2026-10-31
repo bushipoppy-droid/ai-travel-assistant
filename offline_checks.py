@@ -11,8 +11,9 @@ import sys
 import types
 import tempfile
 import unittest
-from unittest.mock import patch
-
+import weather_tools
+import agent_chat
+from unittest.mock import MagicMock, patch
 
 
 # 将openai替换成仅存在于本测试进程中的假模块，确保不发请求
@@ -486,5 +487,237 @@ class OfflineChecks(unittest.TestCase):
         self.assertIn("20.5 °C", output.getvalue())
         # 确认显示的是选中的城市名称，而非搜索词或坐标
         self.assertIn("本次查询地点： 北京", output.getvalue())
+
+    # 检查天气工具能接收坐标、构造请求并返回数据
+    def test_weather_tool_success(self):
+        weather = menu.weather_service
+        sample = {
+            "condition": {"text": "晴"},
+            "temperature": {"value": 20.5, "unit": "°C"},
+        }
+
+        with (
+            # 使用假配置，不读取真实密钥
+            patch.object(
+                weather,
+                "load_weather_config",
+                return_value=("fake-key", "example.invalid"),
+            ),
+
+            # 替换发送函数，不联网
+            patch.object(
+                weather,
+                "fetch_weather",
+                return_value=sample,
+            ) as mock_fetch,
+        ):
+            result = weather.get_current_weather("116.41,39.92")
+
+        # 查询结果应完整返回，且只请求一次
+        self.assertEqual(result, sample)
+        mock_fetch.assert_called_once()
+
+        # 检查实际构造的请求地址与方法
+        request = mock_fetch.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "https://example.invalid/weather/v1/current/39.92/116.41",
+        )
+        self.assertEqual(request.get_method(), "GET")
+    # 检查工具参数不合法时，在读取配置和请求之前停止
+    def test_weather_tool_invalid_input(self):
+        weather = menu.weather_service
+        cases = [
+            None,
+            123,
+            "",
+            "   ",
+            "200,39.92",
+            "abc,39.92",
+        ]
+
+        for location in cases:
+            with self.subTest(location=location):
+                with (
+                    patch.object(
+                        weather, "load_weather_config"
+                    ) as mock_config,
+                    patch.object(
+                        weather, "fetch_weather"
+                    ) as mock_fetch,
+                ):
+                    # 非法输入应主动抛出ValueError
+                    with self.assertRaises(ValueError):
+                        weather.get_current_weather(location)
+
+                mock_config.assert_not_called()
+                mock_fetch.assert_not_called()
+    # 检查JSON参数能够正确传给天气函数
+    def test_weather_tool_json_success(self):
+        sample = {"test": "模拟天气结果"}
+
+        with patch.object(
+            weather_tools.weather_service,
+            "get_current_weather",
+            return_value=sample,
+        ) as mock_weather:
+            result = weather_tools.execute_weather_tool_json(
+                "get_current_weather",
+                '{"location": "116.41,39.92"}',
+            )
+
+        self.assertEqual(result, sample)
+        mock_weather.assert_called_once_with("116.41,39.92")
+
+    # 检查错误调用被拒绝，且没有执行天气函数
+    def test_weather_tool_json_rejects_invalid_call(self):
+        cases = [
+            ("unknown_tool", '{"location": "116.41,39.92"}'),
+            ("get_current_weather", None),
+            ("get_current_weather", "not JSON"),
+            ("get_current_weather", "[]"),
+            ("get_current_weather", "{}"),
+            (
+                "get_current_weather",
+                '{"location": "116.41,39.92", "extra": 1}',
+            ),
+        ]
+
+        for tool_name, arguments_json in cases:
+            with self.subTest(
+                tool=tool_name, arguments=arguments_json
+            ):
+                with patch.object(
+                    weather_tools.weather_service,
+                    "get_current_weather",
+                ) as mock_weather:
+                    with self.assertRaises(ValueError):
+                        weather_tools.execute_weather_tool_json(
+                            tool_name, arguments_json
+                        )
+
+                mock_weather.assert_not_called()
+    # 检查一轮Agent流程：模型调用工具，再根据结果回答
+    def test_agent_tool_round_trip(self):
+        tool_call = types.SimpleNamespace(
+            id="call_test_1",
+            function=types.SimpleNamespace(
+                name="get_current_weather",
+                arguments='{"location": "116.41,39.92"}',
+            ),
+        )
+
+        # 模拟第一次助手消息及其转换成字典的结果
+        first_reply = MagicMock()
+        first_reply.tool_calls = [tool_call]
+        first_reply.model_dump.return_value = {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_test_1",
+                "type": "function",
+                "function": {
+                    "name": "get_current_weather",
+                    "arguments": '{"location": "116.41,39.92"}',
+                },
+            }],
+        }
+
+        final_reply = types.SimpleNamespace(
+            content="该地点当前晴，20.5℃。",
+            tool_calls=None,
+        )
+
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [
+            types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=first_reply)]
+            ),
+            types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=final_reply)]
+            ),
+        ]
+
+        messages = [{
+            "role": "user",
+            "content": "查询116.41,39.92的当前天气。",
+        }]
+
+        # 保留真实流程，只替换工具执行，避免联网
+        with patch.object(
+            agent_chat,
+            "execute_weather_tool_json",
+            return_value={"condition": {"text": "晴"}},
+        ) as mock_tool:
+            answer = agent_chat.run_agent_turn(client, messages)
+
+        self.assertEqual(answer, "该地点当前晴，20.5℃。")
+        mock_tool.assert_called_once_with(
+            "get_current_weather",
+            '{"location": "116.41,39.92"}',
+        )
+
+        calls = client.chat.completions.create.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertIn("tools", calls[0].kwargs)
+        self.assertNotIn("tools", calls[1].kwargs)
+
+        sent = calls[1].kwargs["messages"]
+        self.assertEqual(
+            [message["role"] for message in sent],
+            ["user", "assistant", "tool"],
+        )
+        self.assertEqual(sent[-1]["tool_call_id"], "call_test_1")
+        self.assertEqual(len(messages), 1)
+    # 普通聊天：模型直接回答，不执行工具，也不请求第二次
+    def test_agent_direct_reply(self):
+        reply = types.SimpleNamespace(
+            content="你好，请问想去哪里旅游？",
+            tool_calls=None,
+        )
+
+        with (
+            patch.object(
+                agent_chat, "request_agent_reply",
+                return_value=reply,
+            ) as mock_reply,
+            patch.object(
+                agent_chat, "execute_tool_call"
+            ) as mock_tool,
+        ):
+            answer = agent_chat.run_agent_turn(
+                MagicMock(),
+                [{"role": "user", "content": "你好"}],
+            )
+
+        self.assertEqual(answer, "你好，请问想去哪里旅游？")
+        mock_reply.assert_called_once()
+        mock_tool.assert_not_called()
+
+    # 模型一次提出多个调用：执行前拒绝，避免超出当前能力范围
+    def test_agent_rejects_multiple_tool_calls(self):
+        reply = types.SimpleNamespace(
+            content=None,
+            tool_calls=[MagicMock(), MagicMock()],
+        )
+
+        with (
+            patch.object(
+                agent_chat, "request_agent_reply",
+                return_value=reply,
+            ) as mock_reply,
+            patch.object(
+                agent_chat, "execute_tool_call"
+            ) as mock_tool,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "本轮只支持一次工具调用"
+            ):
+                agent_chat.run_agent_turn(
+                    MagicMock(),
+                    [{"role": "user", "content": "查询两个地点天气"}],
+                )
+
+        mock_reply.assert_called_once()
+        mock_tool.assert_not_called()
 if __name__ == "__main__":
     unittest.main(verbosity=2)

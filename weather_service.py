@@ -227,6 +227,31 @@ def choose_city(cities):
 
         # 用户看到的编号从1开始，Python列表下标从0开始
         return cities[number - 1]
+
+# 供程序调用的天气查询入口，不询问输入、不直接展示天气
+def get_current_weather(location):
+    # 工具参数来自外部，先检查类型和空值
+    if not isinstance(location, str) or not location.strip():
+        raise ValueError("查询坐标必须是非空字符串。")
+
+    location = location.strip()
+
+    # 先检查坐标，非法输入不进入配置读取和请求阶段
+    validate_coordinates(location.replace("，", ","))
+
+    # 密钥由程序读取，不作为模型需要提供的参数
+    api_key, api_host = load_weather_config()
+
+    url = build_current_weather_url(api_host, location)
+    request = Request(
+        url,
+        headers={"X-QW-Api-Key": api_key},
+        method="GET",
+    )
+
+    # 返回解析后的数据，交给调用方决定如何使用
+    return fetch_weather(request)
+
 # 4. 天气查询主流程，供独立运行或统一菜单调用
 def main():
     try:
