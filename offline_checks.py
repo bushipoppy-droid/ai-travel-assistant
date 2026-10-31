@@ -1,6 +1,7 @@
 """离线检查：模拟API，不使用真实密钥，不访问网络。"""
 import contextlib
 import copy
+import gzip
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ import types
 import tempfile
 import unittest
 from unittest.mock import patch
+
 
 
 # 将openai替换成仅存在于本测试进程中的假模块，确保不发请求
@@ -225,16 +227,25 @@ class OfflineChecks(unittest.TestCase):
                     self.assertNotIn("===== 最新保存的预算 =====", read_latest_output())
 
     def test_menu_dispatch_and_return(self):
+        # 收集菜单输出，避免测试时反复打印菜单
         output = io.StringIO()
-        with patch("builtins.input", side_effect=["9", "1", "2", "3", "0"]), \
-             patch.object(chat, "main") as chat_call, \
-             patch.object(budget, "main") as budget_call, \
-             patch.object(menu, "show_latest_budget") as view_call, \
-             contextlib.redirect_stdout(output):
+
+        # 模拟依次选择无效选项、四个功能，最后退出
+        # 各功能都被临时替换，不会真正聊天、生成预算或查询天气
+        with patch("builtins.input", side_effect=["9", "1", "2", "3", "4", "0"]), \
+                patch.object(chat, "main") as chat_call, \
+                patch.object(budget, "main") as budget_call, \
+                patch.object(menu, "show_latest_budget") as view_call, \
+                patch.object(menu.weather_service, "main") as weather_call, \
+                contextlib.redirect_stdout(output):
             menu.main()
+
+        # 检查每个功能是否恰好调用一次
         chat_call.assert_called_once()
         budget_call.assert_called_once()
         view_call.assert_called_once()
+        weather_call.assert_called_once()
+
         self.assertIn("选项无效", output.getvalue())
         self.assertIn("旅游助手已关闭", output.getvalue())
 
@@ -247,6 +258,150 @@ class OfflineChecks(unittest.TestCase):
         self.assertIn("运行提示： 模拟错误", output.getvalue())
         self.assertIn("旅游助手已关闭", output.getvalue())
 
+    # 检查未压缩的响应，包含中文天气描述
+    def test_weather_parse_plain(self):
+        expected = {"code": "200", "now": {"text": "晴", "temp": "20"}}
 
+        # 将字典转换成JSON文字，再转换成模拟响应字节
+        raw_data = json.dumps(expected, ensure_ascii=False).encode("utf-8")
+
+        result = menu.weather_service.parse_weather_response(raw_data, "")
+        self.assertEqual(result, expected)
+
+    # 检查压缩响应是否能解压，并保留完整天气数据
+    def test_weather_parse_gzip(self):
+        expected = {"code": "200", "now": {"text": "多云", "temp": "18"}}
+        raw_data = json.dumps(expected, ensure_ascii=False).encode("utf-8")
+
+        compressed_data = gzip.compress(raw_data)
+        result = menu.weather_service.parse_weather_response(
+            compressed_data, "gzip"
+        )
+        self.assertEqual(result, expected)
+    # 检查断网时是否显示提示，并返回None
+    def test_weather_network_error(self):
+        weather = menu.weather_service
+        output = io.StringIO()
+
+        # 临时替换联网函数，主动抛出模拟断网异常
+        with patch.object(
+            weather,
+            "urlopen",
+            side_effect=weather.URLError("模拟断网"),
+        ) as mock_open:
+            # 收集提示文字，便于后面检查
+            with contextlib.redirect_stdout(output):
+                result = weather.fetch_weather("offline-request")
+
+        # 失败后应返回None，并显示网络提示
+        self.assertIsNone(result)
+        self.assertIn("天气请求未完成", output.getvalue())
+
+        # 确认只尝试了一次，并且设置了超时
+        mock_open.assert_called_once_with("offline-request", timeout=15)
+    # 检查取消查询和非法输入：应显示提示，不能发送请求
+    def test_weather_invalid_input_no_request(self):
+        weather = menu.weather_service
+
+        # 每组数据包含：模拟输入、预期提示
+        cases = [
+            ("退出", "已取消天气查询"),
+            ("", "查询地点不能为空"),
+            ("北京", "暂不支持城市名称"),
+            ("200,39.92", "经度必须在"),
+            ("116.41,100", "纬度必须在"),
+            ("abc,39.92", "必须是数字"),
+        ]
+
+        for location, expected_message in cases:
+            with self.subTest(location=location):
+                output = io.StringIO()
+
+                # 使用假配置，避免读取真实密钥
+                # 替换联网函数，即使程序出错也不会真的发送请求
+                with patch.object(
+                    weather, "load_weather_config",
+                    return_value=("offline-placeholder", "example.invalid"),
+                ), patch(
+                    "builtins.input", return_value=location,
+                ), patch.object(
+                    weather, "urlopen",
+                ) as mock_open, contextlib.redirect_stdout(output):
+                    weather.main()
+
+                self.assertIn(expected_message, output.getvalue())
+                mock_open.assert_not_called()
+    # 检查新版地址：用户输入经度在前，接口路径纬度在前
+    def test_weather_v1_url(self):
+        weather = menu.weather_service
+
+        url = weather.build_current_weather_url(
+            "example.invalid", "116.41,39.92"
+        )
+
+        self.assertEqual(
+            url,
+            "https://example.invalid/weather/v1/current/39.92/116.41",
+        )
+    # 检查新版天气数据是否正确展示
+    def test_weather_v1_display(self):
+        sample = {
+            "condition": {"text": "晴"},
+            "temperature": {"value": 20.5, "unit": "°C"},
+            "metadata": {
+                "attributions": [
+                    "https://developer.qweather.com/attribution.html"
+                ]
+            },
+        }
+        output = io.StringIO()
+
+        # 收集展示文字，不发送请求
+        with contextlib.redirect_stdout(output):
+            menu.weather_service.show_current_weather(sample)
+
+        text = output.getvalue()
+        self.assertIn("天气： 晴", text)
+        self.assertIn("20.5 °C", text)
+        self.assertIn(
+            "https://developer.qweather.com/attribution.html", text
+        )
+    # 检查新版主流程：构造请求后，能展示模拟天气
+    def test_weather_v1_main(self):
+        weather = menu.weather_service
+        output = io.StringIO()
+        sample = {
+            "condition": {"text": "晴"},
+            "temperature": {"value": 20.5, "unit": "°C"},
+            "metadata": {
+                "attributions": [
+                    "https://developer.qweather.com/attribution.html"
+                ]
+            },
+        }
+
+        # 假配置、假输入、假查询，不读取真实密钥或访问网络
+        with patch.object(
+            weather, "load_weather_config",
+            return_value=("offline-placeholder", "example.invalid"),
+        ), patch(
+            "builtins.input", return_value="116.41,39.92",
+        ), patch.object(
+            weather, "fetch_weather", return_value=sample,
+        ) as mock_fetch, contextlib.redirect_stdout(output):
+            weather.main()
+
+        mock_fetch.assert_called_once()
+
+        # 取出传给查询函数的请求对象，检查实际生成的地址
+        request = mock_fetch.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "https://example.invalid/weather/v1/current/39.92/116.41",
+        )
+        self.assertEqual(request.get_method(), "GET")
+
+        self.assertIn("天气： 晴", output.getvalue())
+        self.assertIn("20.5 °C", output.getvalue())
 if __name__ == "__main__":
     unittest.main(verbosity=2)

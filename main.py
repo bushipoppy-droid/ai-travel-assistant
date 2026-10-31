@@ -4,7 +4,8 @@ from openai import APIError
 
 import travel_assistant
 import budget_agent
-
+# 导入天气模块；导入时不会自动查询
+import weather_service
 
 # 1. 读取并展示本地保存的最新预算，不调用API
 def show_latest_budget():
@@ -98,9 +99,10 @@ def main():
         print("1. 多轮聊天")
         print("2. 旅游预算分配与校验")
         print("3. 查看最新预算（不调用API）")
+        print("4. 实时天气查询（调用天气API）")
         print("0. 退出程序")
 
-        choice = input("请选择功能（1/2/3/0）：").strip()
+        choice = input("请选择功能（1/2/3/4/0）：").strip()
 
         if choice == "0":
             print("旅游助手已关闭。")
@@ -115,9 +117,12 @@ def main():
 
             elif choice == "3":
                 show_latest_budget()
+            elif choice == "4":
+                # 调用天气主流程，完成后继续显示菜单
+                weather_service.main()
 
             else:
-                print("选项无效，请输入1、2、3或0。")
+                print("选项无效，请输入1、2、3、4或0。")
 
         except APIError:
             print("API请求失败，请检查网络、余额、密钥权限和模型ID。")
