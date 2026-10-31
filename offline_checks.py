@@ -307,7 +307,6 @@ class OfflineChecks(unittest.TestCase):
         cases = [
             ("退出", "已取消天气查询"),
             ("", "查询地点不能为空"),
-            ("北京", "暂不支持城市名称"),
             ("200,39.92", "经度必须在"),
             ("116.41,100", "纬度必须在"),
             ("abc,39.92", "必须是数字"),
@@ -403,5 +402,89 @@ class OfflineChecks(unittest.TestCase):
 
         self.assertIn("天气： 晴", output.getvalue())
         self.assertIn("20.5 °C", output.getvalue())
+
+    # 检查编号输错后能恢复，并返回用户选中的地点
+    def test_city_selection_input_recovery(self):
+        cities = [
+            {"name": "北京", "lon": "116.41", "lat": "39.92"},
+            {"name": "鼓楼", "lon": "118.77", "lat": "32.07"},
+        ]
+        output = io.StringIO()
+
+        # 依次模拟非数字、越界编号和有效编号
+        with patch(
+            "builtins.input", side_effect=["abc", "9", "2"],
+        ), contextlib.redirect_stdout(output):
+            selected = menu.weather_service.choose_city(cities)
+
+        self.assertEqual(selected, cities[1])
+        self.assertIn("请输入整数编号", output.getvalue())
+        self.assertIn("编号超出范围", output.getvalue())
+    # 检查用户可以取消地点选择
+    def test_city_selection_cancel(self):
+        cities = [
+            {"name": "北京", "lon": "116.41", "lat": "39.92"},
+        ]
+        output = io.StringIO()
+
+        with patch(
+            "builtins.input", return_value="退出",
+        ), contextlib.redirect_stdout(output):
+            selected = menu.weather_service.choose_city(cities)
+
+        self.assertIsNone(selected)
+        self.assertIn("已取消地点选择", output.getvalue())
+    # 检查城市搜索与天气查询的完整串联，不访问真实API
+    def test_city_weather_main(self):
+        weather = menu.weather_service
+        output = io.StringIO()
+
+        city_response = {
+            "code": "200",
+            "location": [
+                {"name": "北京", "lon": "116.41", "lat": "39.92"}
+            ],
+        }
+        weather_response = {
+            "condition": {"text": "晴"},
+            "temperature": {"value": 20.5, "unit": "°C"},
+            "metadata": {
+                "attributions": [
+                    "https://developer.qweather.com/attribution.html"
+                ]
+            },
+        }
+
+        # 第一次模拟城市搜索响应，第二次模拟天气响应
+        with patch.object(
+            weather, "load_weather_config",
+            return_value=("offline-placeholder", "example.invalid"),
+        ), patch(
+            "builtins.input", side_effect=["北京", "1"],
+        ), patch.object(
+            weather, "fetch_weather",
+            side_effect=[city_response, weather_response],
+        ) as mock_fetch, contextlib.redirect_stdout(output):
+            weather.main()
+
+        self.assertEqual(mock_fetch.call_count, 2)
+
+        # 按调用顺序取出两个请求，确认搜索和天气地址
+        search_request = mock_fetch.call_args_list[0].args[0]
+        weather_request = mock_fetch.call_args_list[1].args[0]
+
+        self.assertEqual(
+            search_request.full_url,
+            "https://example.invalid/geo/v2/city/lookup"
+            "?location=%E5%8C%97%E4%BA%AC&number=5",
+        )
+        self.assertEqual(
+            weather_request.full_url,
+            "https://example.invalid/weather/v1/current/39.92/116.41",
+        )
+        self.assertIn("天气： 晴", output.getvalue())
+        self.assertIn("20.5 °C", output.getvalue())
+        # 确认显示的是选中的城市名称，而非搜索词或坐标
+        self.assertIn("本次查询地点： 北京", output.getvalue())
 if __name__ == "__main__":
     unittest.main(verbosity=2)
