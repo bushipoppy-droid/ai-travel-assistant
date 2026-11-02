@@ -2,6 +2,7 @@ import os
 from weather_tools import WEATHER_TOOL
 import json
 from weather_tools import execute_weather_tool_json
+from weather_tools import prepare_weather_result
 
 # 请求模型决定：直接回复，或者提出工具调用
 # allow_tools控制本次请求是否向模型提供工具
@@ -33,6 +34,9 @@ def execute_tool_call(tool_call):
 
         if result is None:
             result = {"error": "天气查询失败，未取得可用数据。"}
+        else:
+            # 查询取得数据后，先校验并只保留必要字段
+            result = prepare_weather_result(result)
 
     except ValueError as error:
         # 名称、JSON或坐标不合法时，把提示返回给模型

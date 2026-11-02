@@ -1,5 +1,6 @@
 import weather_service
 import json
+import math
 
 # 天气工具说明，之后发送给模型，让它决定是否提出调用请求
 WEATHER_TOOL = {
@@ -31,6 +32,62 @@ WEATHER_TOOL = {
         },
     },
 }
+# 校验天气响应，并整理出允许交给模型的必要字段
+def prepare_weather_result(result):
+    if not isinstance(result, dict):
+        raise ValueError("天气响应必须是字典。")
+
+    # get在字段不存在时返回None，交给下面的检查处理
+    condition = result.get("condition")
+    temperature = result.get("temperature")
+    metadata = result.get("metadata")
+
+    if not isinstance(condition, dict):
+        raise ValueError("天气响应缺少有效的天气信息。")
+
+    if not isinstance(temperature, dict):
+        raise ValueError("天气响应缺少有效的温度信息。")
+
+    if not isinstance(metadata, dict):
+        raise ValueError("天气响应缺少有效的来源信息。")
+
+    text = condition.get("text")
+    value = temperature.get("value")
+    unit = temperature.get("unit")
+    attributions = metadata.get("attributions")
+
+    # 天气描述和温度单位必须是非空字符串
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("天气描述必须是非空字符串。")
+
+    # 精确检查类型，避免把True或False当成数字
+    if type(value) not in (int, float):
+        raise ValueError("温度必须是数字。")
+
+    # 浮点数还可能是NaN或无穷大，它们不能作为有效温度
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("温度必须是有限数值。")
+
+    if not isinstance(unit, str) or not unit.strip():
+        raise ValueError("温度单位必须是非空字符串。")
+
+    if not isinstance(attributions, list) or not attributions:
+        raise ValueError("天气响应必须包含来源声明列表。")
+
+    # 每条来源声明都必须是非空字符串
+    sources = []
+    for attribution in attributions:
+        if not isinstance(attribution, str) or not attribution.strip():
+            raise ValueError("来源声明必须是非空字符串。")
+        sources.append(attribution.strip())
+
+    # 创建新字典，只选取需要的字段，不修改原始响应
+    return {
+        "weather": text.strip(),
+        "temperature": value,
+        "unit": unit.strip(),
+        "attributions": sources,
+    }
 
 # 校验工具名称和参数，再调用允许执行的函数
 def execute_weather_tool(tool_name, arguments):

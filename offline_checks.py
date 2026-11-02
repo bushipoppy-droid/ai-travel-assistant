@@ -488,6 +488,69 @@ class OfflineChecks(unittest.TestCase):
         # 确认显示的是选中的城市名称，而非搜索词或坐标
         self.assertIn("本次查询地点： 北京", output.getvalue())
 
+    # 检查天气结果整理：保留必要字段，且不修改原始数据
+    def test_prepare_weather_result_success(self):
+        sample = {
+            "condition": {"text": " 多云 "},
+            "temperature": {"value": -2.5, "unit": " °C "},
+            "metadata": {
+                "attributions": [" https://example.invalid/source "]
+            },
+            "humidity": 82,
+        }
+
+        # 深拷贝作为处理前的快照，用于检查原始数据是否被修改
+        original = copy.deepcopy(sample)
+
+        result = weather_tools.prepare_weather_result(sample)
+
+        # 比较整个字典，也能发现意外保留的额外字段
+        self.assertEqual(result, {
+            "weather": "多云",
+            "temperature": -2.5,
+            "unit": "°C",
+            "attributions": ["https://example.invalid/source"],
+        })
+        self.assertEqual(sample, original)
+    # 检查不合格的天气数据必须被拒绝
+    def test_prepare_weather_result_rejects_invalid_data(self):
+        valid = {
+            "condition": {"text": "晴"},
+            "temperature": {"value": 20.5, "unit": "°C"},
+            "metadata": {
+                "attributions": ["https://example.invalid/source"]
+            },
+        }
+
+        # 顶层类型错误，以及缺少必要信息
+        cases = [None, [], {}]
+
+        # 每次只替换一个部分，让错误原因更明确
+        replacements = [
+            ("condition", None),
+            ("condition", {"text": "   "}),
+            ("temperature", None),
+            ("temperature", {"value": True, "unit": "°C"}),
+            ("temperature", {"value": "20.5", "unit": "°C"}),
+            ("temperature", {"value": float("nan"), "unit": "°C"}),
+            ("temperature", {"value": float("inf"), "unit": "°C"}),
+            ("temperature", {"value": 20.5, "unit": ""}),
+            ("metadata", None),
+            ("metadata", {"attributions": []}),
+            ("metadata", {"attributions": ["   "]}),
+            ("metadata", {"attributions": [123]}),
+        ]
+
+        for field, invalid_value in replacements:
+            sample = copy.deepcopy(valid)
+            sample[field] = invalid_value
+            cases.append(sample)
+
+        for index, sample in enumerate(cases):
+            with self.subTest(case=index):
+                # 必须抛出ValueError；没有抛出就判定测试失败
+                with self.assertRaises(ValueError):
+                    weather_tools.prepare_weather_result(sample)
     # 检查天气工具能接收坐标、构造请求并返回数据
     def test_weather_tool_success(self):
         weather = menu.weather_service
@@ -646,7 +709,14 @@ class OfflineChecks(unittest.TestCase):
         with patch.object(
             agent_chat,
             "execute_weather_tool_json",
-            return_value={"condition": {"text": "晴"}},
+            return_value={
+                "condition": {"text": "晴"},
+                "temperature": {"value": 20.5, "unit": "°C"},
+                "metadata": {
+                    "attributions": ["https://example.invalid/source"]
+                },
+                "humidity": 82,
+            },
         ) as mock_tool:
             answer = agent_chat.run_agent_turn(client, messages)
 
@@ -668,6 +738,45 @@ class OfflineChecks(unittest.TestCase):
         )
         self.assertEqual(sent[-1]["tool_call_id"], "call_test_1")
         self.assertEqual(len(messages), 1)
+        # 检查真正回传模型的内容，确保经过整理
+        tool_result = json.loads(sent[-1]["content"])
+        self.assertEqual(tool_result, {
+            "weather": "晴",
+            "temperature": 20.5,
+            "unit": "°C",
+            "attributions": ["https://example.invalid/source"],
+        })
+    # 检查天气数据不完整时，转换为对应的工具错误消息
+    def test_agent_invalid_weather_returns_error(self):
+        tool_call = types.SimpleNamespace(
+            id="call_invalid_weather",
+            function=types.SimpleNamespace(
+                name="get_current_weather",
+                arguments='{"location": "116.41,39.92"}',
+            ),
+        )
+
+        # 模拟接口返回残缺数据：有天气描述，但缺少温度和来源
+        with patch.object(
+            agent_chat,
+            "execute_weather_tool_json",
+            return_value={"condition": {"text": "晴"}},
+        ) as mock_tool:
+            message = agent_chat.execute_tool_call(tool_call)
+
+        mock_tool.assert_called_once_with(
+            "get_current_weather",
+            '{"location": "116.41,39.92"}',
+        )
+
+        # 即使查询结果不合格，也必须保留对应的工具调用编号
+        self.assertEqual(message["role"], "tool")
+        self.assertEqual(message["tool_call_id"], tool_call.id)
+
+        content = json.loads(message["content"])
+        self.assertEqual(content, {
+            "error": "天气响应缺少有效的温度信息。"
+        })
     # 普通聊天：模型直接回答，不执行工具，也不请求第二次
     def test_agent_direct_reply(self):
         reply = types.SimpleNamespace(
