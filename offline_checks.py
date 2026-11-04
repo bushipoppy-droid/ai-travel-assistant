@@ -767,7 +767,15 @@ class OfflineChecks(unittest.TestCase):
                 "https://developer.qweather.com/attribution.html"
             ],
         })
-        self.assertEqual(len(messages), 1)
+        # 成功后应保存本轮完整历史
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["user", "assistant", "tool", "assistant"],
+        )
+        self.assertEqual(
+            messages[-1]["content"],
+            "该地点当前晴，20.5℃。",
+        )
 
     # 检查天气数据不完整时，转换为对应的工具错误消息
     def test_agent_invalid_weather_returns_error(self):
@@ -1031,5 +1039,126 @@ class OfflineChecks(unittest.TestCase):
                 "location": "116.63,40.32",
             }],
         })
+    # 第二次模型请求失败时，不保存未完成的助手和工具消息
+    def test_agent_failure_keeps_history(self):
+        tool_data = {
+            "id": "call_failure",
+            "type": "function",
+            "function": {
+                "name": "get_current_weather",
+                "arguments": '{"location": "116.41,39.92"}',
+            },
+        }
+
+        tool_call = types.SimpleNamespace(
+            id=tool_data["id"],
+            function=types.SimpleNamespace(
+                **tool_data["function"]
+            ),
+        )
+
+        first_reply = MagicMock()
+        first_reply.tool_calls = [tool_call]
+        first_reply.model_dump.return_value = {
+            "role": "assistant",
+            "tool_calls": [tool_data],
+        }
+
+        messages = [{
+            "role": "user",
+            "content": "查询116.41,39.92的天气。",
+        }]
+        original = copy.deepcopy(messages)
+
+        with (
+            # 第一次提出调用，第二次模拟请求失败
+            patch.object(
+                agent_chat,
+                "request_agent_reply",
+                side_effect=[
+                    first_reply,
+                    RuntimeError("模拟模型请求失败"),
+                ],
+            ) as mock_reply,
+            patch.object(
+                agent_chat,
+                "execute_tool_call",
+                return_value={
+                    "role": "tool",
+                    "tool_call_id": "call_failure",
+                    "content": '{"weather": "晴"}',
+                },
+            ) as mock_tool,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "模拟模型请求失败"
+            ):
+                agent_chat.run_agent_turn(MagicMock(), messages)
+
+        self.assertEqual(messages, original)
+        self.assertEqual(mock_reply.call_count, 2)
+        mock_tool.assert_called_once_with(tool_call)
+    # 检查多轮循环：空输入跳过，成功保留，失败不污染历史
+    def test_agent_main_keeps_only_completed_turns(self):
+        received = []
+        output = io.StringIO()
+
+        # 模拟一轮处理，并记录每轮实际收到的历史
+        def fake_turn(client, messages):
+            received.append(copy.deepcopy(messages))
+            question = messages[-1]["content"]
+
+            if question == "模拟失败":
+                # 故意加入半轮消息，检查入口是否会丢弃
+                messages.append({
+                    "role": "assistant",
+                    "content": "未完成的回复",
+                })
+                raise RuntimeError("模拟失败")
+
+            answer = "回答：" + question
+            messages.append({
+                "role": "assistant",
+                "content": answer,
+            })
+            return answer
+
+        with (
+            # 替换整个SDK，创建客户端也不会联网
+            patch.dict(sys.modules, {"openai": fake_sdk}),
+            patch.object(fake_sdk, "OpenAI") as mock_client,
+            patch.dict(
+                os.environ,
+                {"SILICONFLOW_API_KEY": "fake-key"},
+            ),
+            patch(
+                "builtins.input",
+                side_effect=["", "第一问", "模拟失败", "继续问", "退出"],
+            ),
+            patch.object(
+                agent_chat,
+                "run_agent_turn",
+                side_effect=fake_turn,
+            ) as mock_turn,
+            contextlib.redirect_stdout(output),
+        ):
+            agent_chat.main()
+
+        # 客户端只创建一次；空输入和退出不进入轮次处理
+        mock_client.assert_called_once()
+        self.assertEqual(mock_turn.call_count, 3)
+
+        # 第三次收到的历史应保留第一轮，排除失败轮次
+        self.assertEqual(
+            received[2][1:],
+            [
+                {"role": "user", "content": "第一问"},
+                {"role": "assistant", "content": "回答：第一问"},
+                {"role": "user", "content": "继续问"},
+            ],
+        )
+        self.assertIn("请输入问题", output.getvalue())
+        self.assertIn("本轮未保存", output.getvalue())
+        self.assertIn("对话结束", output.getvalue())
 if __name__ == "__main__":
     unittest.main(verbosity=2)

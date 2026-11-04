@@ -58,6 +58,12 @@ def run_agent_turn(client, messages):
     if not tool_calls:
         if not first_reply.content:
             raise ValueError("模型未返回文字或工具调用。")
+        # 普通回复成功后，保存助手消息并写回历史
+        history.append({
+            "role": "assistant",
+            "content": first_reply.content,
+        })
+        messages[:] = history
         return first_reply.content
 
     # 当前版本只支持一条调用，避免多次执行和费用失控
@@ -83,23 +89,21 @@ def run_agent_turn(client, messages):
     if final_reply.tool_calls or not final_reply.content:
         raise ValueError("模型未返回有效的最终文字回复。")
 
+    # 新建完整历史，不继续修改刚才传给模型的列表
+    completed_history = history + [{
+        "role": "assistant",
+        "content": final_reply.content,
+    }]
+
+    # 全部成功后，统一写回调用方的消息列表
+    messages[:] = completed_history
     return final_reply.content
-# 独立单轮入口，暂不影响原来的菜单和多轮聊天
+# 独立多轮Agent入口，暂不影响原来的统一菜单
 def main():
     # 只有启动入口时才需要真实SDK
     from openai import OpenAI, APIError
 
     try:
-        question = input("请输入问题（输入“退出”取消）：").strip()
-
-        if question == "退出":
-            print("已取消。")
-            return
-
-        if not question:
-            print("问题不能为空。")
-            return
-
         api_key = os.getenv("SILICONFLOW_API_KEY")
         if not api_key:
             raise ValueError("请先配置SILICONFLOW_API_KEY。")
@@ -125,7 +129,8 @@ def main():
                     "搜索后展示候选名称、行政区划和对应坐标，请用户确认。"
                     "不得擅自选择第一个候选。"
                     "候选为空时如实说明未获得可用地点。"
-                    "当前是单轮程序，请用户下次提供确认后的经纬度。"
+                    "用户确认历史候选地点后，只能使用该候选已有的坐标。"
+                    "确认不明确时继续追问，不得猜测地点。"
                     "工具失败时如实说明，不把错误当成天气。"
                     "天气回答只使用工具返回的weather、temperature、"
                     "unit和sources字段。"
@@ -133,11 +138,39 @@ def main():
                     "不要补充工具未返回的风向、体感温度等实时信息。"
                 ),
             },
-            {"role": "user", "content": question},
         ]
 
-        answer = run_agent_turn(client, messages)
-        print("助手：", answer)
+        print("旅游Agent已启动，输入“退出”结束。")
+
+        while True:
+            question = input("\n你：").strip()
+
+            if question == "退出":
+                print("对话结束。")
+                break
+
+            if not question:
+                print("请输入问题，或输入“退出”。")
+                continue
+
+            # 本轮先使用临时列表，失败时不保存本轮用户问题
+            turn_messages = messages + [{
+                "role": "user",
+                "content": question,
+            }]
+
+            try:
+                answer = run_agent_turn(client, turn_messages)
+            except APIError:
+                print("模型请求失败，本轮未保存，请稍后再试。")
+                continue
+            except (ValueError, RuntimeError) as error:
+                print("本轮未保存：", error)
+                continue
+
+            # 成功后保存完整历史，下一轮继续使用
+            messages = turn_messages
+            print("助手：", answer)
 
     except APIError:
         print("模型请求失败，请检查网络、权限、余额或模型支持情况。")
