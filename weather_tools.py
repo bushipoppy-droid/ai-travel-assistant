@@ -1,6 +1,7 @@
 import weather_service
 import json
 import math
+
 # 天气工具说明，之后发送给模型，让它决定是否提出调用请求
 WEATHER_TOOL = {
     "type": "function",
@@ -31,7 +32,6 @@ WEATHER_TOOL = {
         },
     },
 }
-
 # 校验工具名称和参数，再调用允许执行的函数
 def execute_weather_tool(tool_name, arguments):
     # 只允许调用明确支持的工具
@@ -107,8 +107,8 @@ def normalize_weather_result(result):
 
     # 新建结果字典，不把风向等其他字段交给模型
     return {
-        "weather": text,
+        "weather": text.strip(),
         "temperature": value,
-        "unit": unit,
-        "sources": list(sources),
+        "unit": unit.strip(),
+        "sources": [source.strip() for source in sources],
     }
