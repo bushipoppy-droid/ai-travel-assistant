@@ -125,12 +125,102 @@ def validate_candidate_location(location, candidates):
             return
 
     raise ValueError("查询坐标不属于候选列表，请确认地点。")
+# 识别“选第1个”这样的明确命令，返回对应候选
+def select_candidate_by_command(question, candidates):
+    question = question.strip()
+
+    # 暂时只识别这一种格式；其他文字返回None
+    if not (
+        question.startswith("选第")
+        and question.endswith("个")
+    ):
+        return None
+
+    # 例如“选第2个”，取出中间的“2”
+    number_text = question[2:-1]
+
+    if not (number_text.isascii() and number_text.isdigit()):
+        raise ValueError("请使用选第1个这样的格式。")
+
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("没有可供选择的候选，请先搜索城市。")
+
+    number = int(number_text)
+    if not 1 <= number <= len(candidates):
+        raise ValueError("候选编号超出范围。")
+
+    # 用户编号从1开始，列表下标从0开始
+    selected = candidates[number - 1]
+
+    if not isinstance(selected, dict):
+        raise ValueError("候选地点格式错误。")
+
+    # 复用已有函数检查选中候选的坐标
+    validate_candidate_location(
+        selected.get("location"), [selected]
+    )
+
+    return dict(selected)
+# 按候选原始顺序生成展示文字，编号由程序决定
+def format_city_candidates(candidates):
+    if not isinstance(candidates, list):
+        raise ValueError("城市候选必须是列表。")
+
+    if not candidates:
+        return "没有可供选择的地点，请重新搜索。"
+
+    lines = ["城市候选（以下编号由程序生成）："]
+
+    for number, candidate in enumerate(candidates, start=1):
+        if not isinstance(candidate, dict):
+            raise ValueError("候选地点格式错误。")
+
+        # 检查候选坐标及编号；名称已由候选整理函数校验
+        selected = select_candidate_by_command(
+            f"选第{number}个", candidates
+        )
+
+        # 组合行政区划，省略缺失的部分
+        parts = [
+            selected.get("country", ""),
+            selected.get("adm1", ""),
+            selected.get("adm2", ""),
+            selected.get("name", ""),
+        ]
+        label = " / ".join(part for part in parts if part)
+
+        lines.append(
+            f"{number}. {label}；坐标：{selected['location']}"
+        )
+
+    lines.append("请输入“选第1个”等命令确认地点。")
+    return "\n".join(lines)
 # 处理一轮对话：最多执行一次工具、请求模型两次
 def run_agent_turn(client, messages):
     # 复制列表，避免执行到一半失败时修改调用方的历史
     history = list(messages)
 
-    first_reply = request_agent_reply(client, history)
+    # 请求模型前，先由程序解析明确的候选编号
+    latest_candidates = get_latest_city_candidates(history)
+    question = messages[-1]["content"]
+    selected = select_candidate_by_command(
+        question, latest_candidates
+    )
+
+    request_messages = history
+
+    if selected is not None:
+        # 本轮确认规则只用于当前请求，不写入保存的历史
+        request_messages = history + [{
+            "role": "system",
+            "content": (
+                "本轮用户已通过编号确认地点。"
+                f"查询当前天气时只能使用坐标：{selected['location']}。"
+                "请调用天气工具，不得改用其他候选坐标。"
+            ),
+        }]
+
+    first_reply = request_agent_reply(client, request_messages)
     tool_calls = first_reply.tool_calls or []
 
     # 模型没有提出工具调用，直接返回文字
@@ -160,9 +250,13 @@ def run_agent_turn(client, messages):
     candidates = None
 
     if tool_call.function.name == "get_current_weather":
-        candidates = get_latest_city_candidates(history)
+        candidates = latest_candidates
 
-        if candidates is not None:
+        if selected is not None:
+            # 明确选择后，本轮只允许这一个候选的坐标
+            candidates = [selected]
+
+        elif candidates is not None:
             # 整条输入为新坐标时，以用户明确提供的坐标作为本轮约束
             question = messages[-1]["content"].replace("，", ",").strip()
 
@@ -185,6 +279,20 @@ def run_agent_turn(client, messages):
         )
 
     history.append(tool_result)
+
+    # 城市搜索成功时，由程序生成固定编号，避免模型重排
+    if tool_call.function.name == "search_city_candidates":
+        payload = json.loads(tool_result["content"])
+
+        if "candidates" in payload:
+            answer = format_city_candidates(payload["candidates"])
+
+            # 保存调用、工具结果和程序生成的候选展示
+            messages[:] = history + [{
+                "role": "assistant",
+                "content": answer,
+            }]
+            return answer
 
     # 将结果交回模型，本次不再提供工具
     final_reply = request_agent_reply(
@@ -233,6 +341,7 @@ def main():
                     "搜索结果不是天气，不能据此声称已查询当前天气。"
                     "搜索后展示候选名称、行政区划和对应坐标，请用户确认。"
                     "不得擅自选择第一个候选。"
+                    "确认程序编号时，请用户输入“选第1个”这样的明确命令。"
                     "候选为空时如实说明未获得可用地点。"
                     "用户确认历史候选地点后，只能使用该候选已有的坐标。"
                     "确认不明确时继续追问，不得猜测地点。"

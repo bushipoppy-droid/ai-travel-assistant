@@ -980,10 +980,6 @@ class OfflineChecks(unittest.TestCase):
             }],
         }
 
-        final_reply = types.SimpleNamespace(
-            content="找到北京市怀柔，请确认地点及坐标。",
-            tool_calls=None,
-        )
         candidates = [{
             "name": "怀柔",
             "country": "中国",
@@ -993,12 +989,17 @@ class OfflineChecks(unittest.TestCase):
             "lat": "40.32",
         }]
 
+        messages = [{
+            "role": "user",
+            "content": "怀柔天气怎么样？",
+        }]
+
         with (
-            # 模拟两次模型回复
+            # 模拟一次模型回复，候选展示由程序生成
             patch.object(
                 agent_chat,
                 "request_agent_reply",
-                side_effect=[first_reply, final_reply],
+                return_value=first_reply,
             ) as mock_reply,
             patch.object(
                 weather_tools.weather_service,
@@ -1011,26 +1012,28 @@ class OfflineChecks(unittest.TestCase):
             ) as mock_weather,
         ):
             answer = agent_chat.run_agent_turn(
-                MagicMock(),
-                [{"role": "user", "content": "怀柔天气怎么样？"}],
+                MagicMock(), messages
             )
 
-        self.assertEqual(answer, final_reply.content)
+        self.assertEqual(answer, (
+            "城市候选（以下编号由程序生成）：\n"
+            "1. 中国 / 北京市 / 北京 / 怀柔；坐标：116.63,40.32\n"
+            "请输入“选第1个”等命令确认地点。"
+        ))
         mock_search.assert_called_once_with("怀柔")
         mock_weather.assert_not_called()
-        self.assertEqual(mock_reply.call_count, 2)
+        mock_reply.assert_called_once()
 
-        # 第二次模型请求应携带城市工具结果，并关闭工具
-        second_call = mock_reply.call_args_list[1]
-        self.assertFalse(second_call.kwargs["allow_tools"])
-
-        sent = second_call.args[1]
+        # 完整历史仍然保存，供下一轮确认使用
         self.assertEqual(
-            [message["role"] for message in sent],
-            ["user", "assistant", "tool"],
+            [message["role"] for message in messages],
+            ["user", "assistant", "tool", "assistant"],
         )
-        self.assertEqual(sent[-1]["tool_call_id"], tool_call.id)
-        self.assertEqual(json.loads(sent[-1]["content"]), {
+        self.assertEqual(messages[-1]["content"], answer)
+
+        tool_message = messages[-2]
+        self.assertEqual(tool_message["tool_call_id"], tool_call.id)
+        self.assertEqual(json.loads(tool_message["content"]), {
             "candidates": [{
                 "name": "怀柔",
                 "country": "中国",
@@ -1039,6 +1042,7 @@ class OfflineChecks(unittest.TestCase):
                 "location": "116.63,40.32",
             }],
         })
+
     # 第二次模型请求失败时，不保存未完成的助手和工具消息
     def test_agent_failure_keeps_history(self):
         tool_data = {
@@ -1365,5 +1369,117 @@ class OfflineChecks(unittest.TestCase):
                     tool_call,
                     candidates=expected_scope,
                 )
+    # 检查明确编号选择、无法识别的输入及错误编号
+    def test_explicit_candidate_selection(self):
+        candidates = [
+            {"name": "北京", "location": "116.40529,39.90499"},
+            {"name": "怀柔", "location": "116.63712,40.32427"},
+        ]
+        original = copy.deepcopy(candidates)
+
+        selected = agent_chat.select_candidate_by_command(
+            "选第2个", candidates
+        )
+        self.assertEqual(selected, candidates[1])
+
+        # 返回独立字典，不应直接修改原候选
+        selected["name"] = "测试修改"
+        self.assertEqual(candidates, original)
+
+        # 不支持的自然语言不自动选择
+        self.assertIsNone(
+            agent_chat.select_candidate_by_command(
+                "想去怀柔", candidates
+            )
+        )
+
+        # 错误编号必须明确拒绝
+        for question in ["选第0个", "选第9个", "选第abc个"]:
+            with self.subTest(question=question):
+                with self.assertRaises(ValueError):
+                    agent_chat.select_candidate_by_command(
+                        question, candidates
+                    )
+
+        # 没有候选时也不能选择
+        with self.assertRaises(ValueError):
+            agent_chat.select_candidate_by_command("选第1个", [])
+    # 用户选第二个时，即使模型调用第一个，也不能执行查询
+    def test_agent_blocks_wrong_selected_candidate(self):
+        candidates = [
+            {"name": "北京", "location": "116.41,39.92"},
+            {"name": "怀柔", "location": "116.63,40.32"},
+        ]
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "city_selection",
+                    "function": {
+                        "name": "search_city_candidates"
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "city_selection",
+                "content": json.dumps({
+                    "candidates": candidates
+                }),
+            },
+            {"role": "user", "content": "选第2个"},
+        ]
+
+        # 故意模拟错误调用：请求第一个候选的坐标
+        tool_data = {
+            "id": "wrong_selection",
+            "type": "function",
+            "function": {
+                "name": "get_current_weather",
+                "arguments": '{"location": "116.41,39.92"}',
+            },
+        }
+        tool_call = types.SimpleNamespace(
+            id=tool_data["id"],
+            function=types.SimpleNamespace(
+                **tool_data["function"]
+            ),
+        )
+
+        first_reply = MagicMock()
+        first_reply.tool_calls = [tool_call]
+        first_reply.model_dump.return_value = {
+            "role": "assistant",
+            "tool_calls": [tool_data],
+        }
+        final_reply = types.SimpleNamespace(
+            content="查询坐标与所选地点不符，未执行查询。",
+            tool_calls=None,
+        )
+
+        with (
+            patch.object(
+                agent_chat,
+                "request_agent_reply",
+                side_effect=[first_reply, final_reply],
+            ) as mock_reply,
+            patch.object(
+                agent_chat,
+                "execute_weather_tool_json",
+            ) as mock_execute,
+        ):
+            agent_chat.run_agent_turn(MagicMock(), messages)
+
+        # 保留真实选择和校验逻辑，检查实际入口确实没被调用
+        mock_execute.assert_not_called()
+        self.assertEqual(mock_reply.call_count, 2)
+
+        # 第二次模型请求收到的应是错误，而不是天气数据
+        sent = mock_reply.call_args_list[1].args[1]
+        self.assertEqual(sent[-1]["tool_call_id"], "wrong_selection")
+        self.assertEqual(json.loads(sent[-1]["content"]), {
+            "error": "查询坐标不属于候选列表，请确认地点。"
+        })
 if __name__ == "__main__":
     unittest.main(verbosity=2)
