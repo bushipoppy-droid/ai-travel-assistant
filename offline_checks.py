@@ -1160,5 +1160,210 @@ class OfflineChecks(unittest.TestCase):
         self.assertIn("请输入问题", output.getvalue())
         self.assertIn("本轮未保存", output.getvalue())
         self.assertIn("对话结束", output.getvalue())
+    # 检查使用最新搜索结果，失败时不退回旧候选
+    def test_latest_city_candidates(self):
+        history = []
+
+        old_candidates = [
+            {"name": "北京", "location": "116.41,39.92"}
+        ]
+        new_candidates = [
+            {"name": "怀柔", "location": "116.63,40.32"}
+        ]
+
+        # 按时间顺序加入两次搜索的调用与结果
+        for call_id, candidates in [
+            ("city_old", old_candidates),
+            ("city_new", new_candidates),
+        ]:
+            history.extend([
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "function": {
+                            "name": "search_city_candidates"
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps({
+                        "candidates": candidates
+                    }),
+                },
+            ])
+
+        self.assertEqual(
+            agent_chat.get_latest_city_candidates(history),
+            new_candidates,
+        )
+
+        # 将最新结果改为失败，不能重新启用更早的北京候选
+        history[-1]["content"] = json.dumps({
+            "error": "模拟城市搜索失败"
+        })
+        self.assertEqual(
+            agent_chat.get_latest_city_candidates(history),
+            [],
+        )
+    # 检查候选坐标允许等价写法，并拒绝列表外坐标
+    def test_candidate_location_match(self):
+        candidates = [
+            {"name": "怀柔", "location": "116.63,40.32"}
+        ]
+
+        # 中文逗号、首尾空格和末尾零不影响数字匹配
+        for location in [
+            "116.63,40.32",
+            " 116.630，40.320 ",
+        ]:
+            with self.subTest(location=location):
+                agent_chat.validate_candidate_location(
+                    location, candidates
+                )
+
+        # 列表外坐标必须被拒绝
+        with self.assertRaisesRegex(
+            ValueError, "查询坐标不属于候选列表"
+        ):
+            agent_chat.validate_candidate_location(
+                "121.47,31.23", candidates
+            )
+
+        # 没有候选时，也不能认定匹配成功
+        with self.assertRaises(ValueError):
+            agent_chat.validate_candidate_location(
+                "116.63,40.32", []
+            )
+    # 检查列表外坐标和空候选都会在执行查询前被拦截
+    def test_candidate_guard_blocks_weather_request(self):
+        tool_call = types.SimpleNamespace(
+            id="call_outside_candidates",
+            function=types.SimpleNamespace(
+                name="get_current_weather",
+                arguments='{"location": "121.47,31.23"}',
+            ),
+        )
+
+        cases = [
+            # 只有怀柔候选，不能查询其他坐标
+            [{"name": "怀柔", "location": "116.63,40.32"}],
+
+            # 搜索过但没有可用候选，也不能放行
+            [],
+        ]
+
+        for candidates in cases:
+            with self.subTest(candidates=candidates):
+                with patch.object(
+                    agent_chat,
+                    "execute_weather_tool_json",
+                ) as mock_execute:
+                    message = agent_chat.execute_tool_call(
+                        tool_call,
+                        candidates=candidates,
+                    )
+
+                # 关键：校验失败后，没有进入实际工具执行入口
+                mock_execute.assert_not_called()
+
+                self.assertEqual(
+                    json.loads(message["content"]),
+                    {"error": "查询坐标不属于候选列表，请确认地点。"},
+                )
+                self.assertEqual(
+                    message["tool_call_id"],
+                    "call_outside_candidates",
+                )
+    # 检查普通确认使用历史候选，新坐标输入覆盖旧候选
+    def test_agent_selects_coordinate_scope(self):
+        old_candidates = [
+            {"name": "怀柔", "location": "116.63,40.32"}
+        ]
+
+        cases = [
+            ("选怀柔", "116.63,40.32", old_candidates),
+            (
+                "121.47,31.23",
+                "121.47,31.23",
+                [{"location": "121.47,31.23"}],
+            ),
+        ]
+
+        for question, requested, expected_scope in cases:
+            with self.subTest(question=question):
+                tool_data = {
+                    "id": "weather_scope",
+                    "type": "function",
+                    "function": {
+                        "name": "get_current_weather",
+                        "arguments": json.dumps({
+                            "location": requested
+                        }),
+                    },
+                }
+                tool_call = types.SimpleNamespace(
+                    id=tool_data["id"],
+                    function=types.SimpleNamespace(
+                        **tool_data["function"]
+                    ),
+                )
+
+                first_reply = MagicMock()
+                first_reply.tool_calls = [tool_call]
+                first_reply.model_dump.return_value = {
+                    "role": "assistant",
+                    "tool_calls": [tool_data],
+                }
+                final_reply = types.SimpleNamespace(
+                    content="模拟回答", tool_calls=None
+                )
+
+                # 准备此前的城市搜索记录，以及当前用户输入
+                messages = [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "city_scope",
+                            "function": {
+                                "name": "search_city_candidates"
+                            },
+                        }],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "city_scope",
+                        "content": json.dumps({
+                            "candidates": old_candidates
+                        }),
+                    },
+                    {"role": "user", "content": question},
+                ]
+
+                with (
+                    patch.object(
+                        agent_chat, "request_agent_reply",
+                        side_effect=[first_reply, final_reply],
+                    ),
+                    patch.object(
+                        agent_chat, "execute_tool_call",
+                        return_value={
+                            "role": "tool",
+                            "tool_call_id": "weather_scope",
+                            "content": '{"weather": "晴"}',
+                        },
+                    ) as mock_execute,
+                ):
+                    answer = agent_chat.run_agent_turn(
+                        MagicMock(), messages
+                    )
+
+                self.assertEqual(answer, "模拟回答")
+                mock_execute.assert_called_once_with(
+                    tool_call,
+                    candidates=expected_scope,
+                )
 if __name__ == "__main__":
     unittest.main(verbosity=2)

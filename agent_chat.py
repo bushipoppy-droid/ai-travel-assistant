@@ -2,7 +2,7 @@ import os
 from weather_tools import WEATHER_TOOL, CITY_SEARCH_TOOL
 import json
 from weather_tools import execute_weather_tool_json
-
+import weather_service
 # 请求模型决定：直接回复，或者提出工具调用
 # allow_tools控制本次请求是否向模型提供工具
 def request_agent_reply(client, messages, allow_tools=True):
@@ -25,11 +25,24 @@ def request_agent_reply(client, messages, allow_tools=True):
     return response.choices[0].message
 
 # 执行工具调用，将结果或可预期的错误整理为消息
-def execute_tool_call(tool_call):
+def execute_tool_call(tool_call, candidates=None):
     tool_name = tool_call.function.name
     arguments_json = tool_call.function.arguments
 
     try:
+        # 有候选约束时，先检查坐标，再允许实际查询
+        if tool_name == "get_current_weather" and candidates is not None:
+            if not isinstance(arguments_json, str):
+                raise ValueError("工具参数必须是JSON字符串。")
+
+            arguments = json.loads(arguments_json)
+            if not isinstance(arguments, dict):
+                raise ValueError("工具参数必须是字典。")
+
+            validate_candidate_location(
+                arguments.get("location"), candidates
+            )
+
         result = execute_weather_tool_json(
             tool_name, arguments_json
         )
@@ -46,6 +59,72 @@ def execute_tool_call(tool_call):
         "tool_call_id": tool_call.id,
         "content": json.dumps(result, ensure_ascii=False),
     }
+# 从历史中找到最近一次城市搜索结果
+def get_latest_city_candidates(messages):
+    # 记录调用编号对应的工具名称，避免混淆不同工具的结果
+    tool_names = {}
+
+    for message in messages:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                tool_names[call["id"]] = call["function"]["name"]
+
+    # 从后向前查找，优先使用最近的搜索结果
+    for message in reversed(messages):
+        if message.get("role") != "tool":
+            continue
+
+        call_id = message.get("tool_call_id")
+        if tool_names.get(call_id) != "search_city_candidates":
+            continue
+
+        try:
+            result = json.loads(message["content"])
+        except (ValueError, TypeError, KeyError):
+            raise ValueError("历史中的城市搜索结果无法解析。") from None
+
+        if not isinstance(result, dict):
+            raise ValueError("历史中的城市搜索结果格式错误。")
+
+        # 最近一次搜索失败时，不退回更早的候选
+        if "error" in result:
+            return []
+
+        candidates = result.get("candidates")
+        if not isinstance(candidates, list):
+            raise ValueError("历史中的候选列表格式错误。")
+
+        return candidates
+
+    # None表示没有搜索历史；空列表表示搜索过但没有可用候选
+    return None
+# 检查天气调用坐标是否来自给定候选列表
+def validate_candidate_location(location, candidates):
+    # 将坐标文字转换为数字对，统一空格和逗号差异
+    def coordinate_pair(value):
+        if not isinstance(value, str):
+            raise ValueError("候选匹配坐标必须是字符串。")
+
+        value = value.replace("，", ",").strip()
+        weather_service.validate_coordinates(value)
+
+        longitude, latitude = value.split(",")
+        return float(longitude), float(latitude)
+
+    requested = coordinate_pair(location)
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("历史候选地点格式错误。")
+
+        candidate_location = coordinate_pair(
+            candidate.get("location")
+        )
+
+        if requested == candidate_location:
+            return
+
+    raise ValueError("查询坐标不属于候选列表，请确认地点。")
 # 处理一轮对话：最多执行一次工具、请求模型两次
 def run_agent_turn(client, messages):
     # 复制列表，避免执行到一半失败时修改调用方的历史
@@ -77,9 +156,35 @@ def run_agent_turn(client, messages):
             exclude_none=True,
         )
     )
-    # 开发时观察实际执行的工具，不打印参数或密钥
-    print("正在执行工具：", tool_calls[0].function.name)
-    history.append(execute_tool_call(tool_calls[0]))
+    tool_call = tool_calls[0]
+    candidates = None
+
+    if tool_call.function.name == "get_current_weather":
+        candidates = get_latest_city_candidates(history)
+
+        if candidates is not None:
+            # 整条输入为新坐标时，以用户明确提供的坐标作为本轮约束
+            question = messages[-1]["content"].replace("，", ",").strip()
+
+            try:
+                weather_service.validate_coordinates(question)
+            except ValueError:
+                # 普通文字确认继续使用最近一次搜索候选
+                pass
+            else:
+                candidates = [{"location": question}]
+
+    # 这里只表示开始处理，参数校验失败时不会真正查询
+    print("正在处理工具调用：", tool_call.function.name)
+
+    if candidates is None:
+        tool_result = execute_tool_call(tool_call)
+    else:
+        tool_result = execute_tool_call(
+            tool_call, candidates=candidates
+        )
+
+    history.append(tool_result)
 
     # 将结果交回模型，本次不再提供工具
     final_reply = request_agent_reply(
