@@ -1,5 +1,5 @@
 import os
-from weather_tools import WEATHER_TOOL
+from weather_tools import WEATHER_TOOL, CITY_SEARCH_TOOL
 import json
 from weather_tools import execute_weather_tool_json
 
@@ -9,7 +9,10 @@ def request_agent_reply(client, messages, allow_tools=True):
     # 第二次请求不提供工具，只让模型根据结果回答
     tool_options = {}
     if allow_tools:
-        tool_options["tools"] = [WEATHER_TOOL]
+        tool_options["tools"] = [
+            WEATHER_TOOL,
+            CITY_SEARCH_TOOL,
+        ]
 
     response = client.chat.completions.create(
         model=os.getenv("SILICONFLOW_MODEL", "Qwen/Qwen3-32B"),
@@ -116,8 +119,13 @@ def main():
                 "content": (
                     "你是旅游助手，回复简洁。"
                     "查询当前天气时使用工具，不编造实时天气。"
-                    "只有用户明确提供经纬度时才能查询，不得猜测坐标。"
-                    "缺少坐标时请用户补充，目前不能自动搜索城市。"
+                    "用户明确提供经纬度时，可以调用天气工具。"
+                    "只有城市名称时，调用城市搜索工具，不得猜测坐标。"
+                    "搜索结果不是天气，不能据此声称已查询当前天气。"
+                    "搜索后展示候选名称、行政区划和对应坐标，请用户确认。"
+                    "不得擅自选择第一个候选。"
+                    "候选为空时如实说明未获得可用地点。"
+                    "当前是单轮程序，请用户下次提供确认后的经纬度。"
                     "工具失败时如实说明，不把错误当成天气。"
                     "天气回答只使用工具返回的weather、temperature、"
                     "unit和sources字段。"

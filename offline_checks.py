@@ -892,5 +892,144 @@ class OfflineChecks(unittest.TestCase):
                     "call_invalid_temperature",
                 )
                 mock_weather.assert_called_once_with("116.41,39.92")
+    # 检查城市搜索工具的参数传递、候选整理和结果回传
+    def test_agent_city_search_returns_candidates(self):
+        tool_call = types.SimpleNamespace(
+            id="call_city_1",
+            function=types.SimpleNamespace(
+                name="search_city_candidates",
+                arguments='{"city_name": "怀柔"}',
+            ),
+        )
+
+        sample = [{
+            "name": " 怀柔 ",
+            "country": "中国",
+            "adm1": "北京市",
+            "adm2": "北京",
+            "lon": "116.63",
+            "lat": "40.32",
+            "rank": "额外字段",
+        }]
+
+        with (
+            patch.object(
+                weather_tools.weather_service,
+                "load_weather_config",
+                return_value=("fake-key", "example.invalid"),
+            ),
+            patch.object(
+                weather_tools.weather_service,
+                "lookup_city",
+                return_value=sample,
+            ) as mock_lookup,
+            patch.object(
+                weather_tools.weather_service,
+                "get_current_weather",
+            ) as mock_weather,
+        ):
+            message = agent_chat.execute_tool_call(tool_call)
+
+        mock_lookup.assert_called_once_with(
+            "fake-key", "example.invalid", "怀柔"
+        )
+
+        # 搜索地点不等于查天气，不能偷偷继续执行
+        mock_weather.assert_not_called()
+
+        self.assertEqual(message["role"], "tool")
+        self.assertEqual(message["tool_call_id"], "call_city_1")
+        self.assertEqual(json.loads(message["content"]), {
+            "candidates": [{
+                "name": "怀柔",
+                "country": "中国",
+                "adm1": "北京市",
+                "adm2": "北京",
+                "location": "116.63,40.32",
+            }],
+        })
+    # 检查城市搜索结果能回传给模型，且不会继续查询天气
+    def test_agent_city_search_round_trip(self):
+        tool_call = types.SimpleNamespace(
+            id="call_city_flow",
+            function=types.SimpleNamespace(
+                name="search_city_candidates",
+                arguments='{"city_name": "怀柔"}',
+            ),
+        )
+
+        first_reply = MagicMock()
+        first_reply.tool_calls = [tool_call]
+        first_reply.model_dump.return_value = {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": tool_call.id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                },
+            }],
+        }
+
+        final_reply = types.SimpleNamespace(
+            content="找到北京市怀柔，请确认地点及坐标。",
+            tool_calls=None,
+        )
+        candidates = [{
+            "name": "怀柔",
+            "country": "中国",
+            "adm1": "北京市",
+            "adm2": "北京",
+            "lon": "116.63",
+            "lat": "40.32",
+        }]
+
+        with (
+            # 模拟两次模型回复
+            patch.object(
+                agent_chat,
+                "request_agent_reply",
+                side_effect=[first_reply, final_reply],
+            ) as mock_reply,
+            patch.object(
+                weather_tools.weather_service,
+                "search_city_candidates",
+                return_value=candidates,
+            ) as mock_search,
+            patch.object(
+                weather_tools.weather_service,
+                "get_current_weather",
+            ) as mock_weather,
+        ):
+            answer = agent_chat.run_agent_turn(
+                MagicMock(),
+                [{"role": "user", "content": "怀柔天气怎么样？"}],
+            )
+
+        self.assertEqual(answer, final_reply.content)
+        mock_search.assert_called_once_with("怀柔")
+        mock_weather.assert_not_called()
+        self.assertEqual(mock_reply.call_count, 2)
+
+        # 第二次模型请求应携带城市工具结果，并关闭工具
+        second_call = mock_reply.call_args_list[1]
+        self.assertFalse(second_call.kwargs["allow_tools"])
+
+        sent = second_call.args[1]
+        self.assertEqual(
+            [message["role"] for message in sent],
+            ["user", "assistant", "tool"],
+        )
+        self.assertEqual(sent[-1]["tool_call_id"], tool_call.id)
+        self.assertEqual(json.loads(sent[-1]["content"]), {
+            "candidates": [{
+                "name": "怀柔",
+                "country": "中国",
+                "adm1": "北京市",
+                "adm2": "北京",
+                "location": "116.63,40.32",
+            }],
+        })
 if __name__ == "__main__":
     unittest.main(verbosity=2)

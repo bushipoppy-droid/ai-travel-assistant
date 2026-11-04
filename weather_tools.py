@@ -32,32 +32,67 @@ WEATHER_TOOL = {
         },
     },
 }
-# 校验工具名称和参数，再调用允许执行的函数
+# 城市搜索工具：返回候选地点，供用户确认
+CITY_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_city_candidates",
+        "description": (
+            "根据城市或地区名称搜索候选地点及坐标。"
+            "缺少明确坐标时可以使用。"
+            "结果不是天气数据；应展示候选地点让用户确认，"
+            "不得擅自选择第一个候选或声称已查询天气。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city_name": {
+                    "type": "string",
+                    "description": "用户提供的城市或地区名称，例如北京。",
+                },
+            },
+            "required": ["city_name"],
+        },
+    },
+}
+# 根据工具名称分发，分别检查参数和整理结果
 def execute_weather_tool(tool_name, arguments):
-    # 只允许调用明确支持的工具
-    if tool_name != "get_current_weather":
+    # 仅允许明确登记的两个工具
+    if tool_name not in {
+        "get_current_weather",
+        "search_city_candidates",
+    }:
         raise ValueError("不支持的工具名称。")
 
-    # 参数必须是字典
     if not isinstance(arguments, dict):
         raise ValueError("工具参数必须是字典。")
 
-    # 必须且只能提供location，拒绝缺少或多余参数
+    # 城市搜索分支
+    if tool_name == "search_city_candidates":
+        if set(arguments) != {"city_name"}:
+            raise ValueError("城市搜索参数必须且只能包含city_name。")
+
+        candidates = weather_service.search_city_candidates(
+            arguments["city_name"]
+        )
+
+        # 返回候选列表，不在这里选择地点或继续查询天气
+        return {
+            "candidates": normalize_city_candidates(candidates),
+        }
+
+    # 天气查询分支：保持原有行为
     if set(arguments) != {"location"}:
         raise ValueError("工具参数必须且只能包含location。")
 
-    # 先取得接口原始数据
     result = weather_service.get_current_weather(
         arguments["location"]
     )
 
-    # 查询失败时保留None，交给Agent层转成错误消息
     if result is None:
         return None
 
-    # 检查响应并整理，只返回必要字段
     return normalize_weather_result(result)
-
 # 将工具参数JSON解析成字典，再交给执行入口检查
 def execute_weather_tool_json(tool_name, arguments_json):
     if not isinstance(arguments_json, str):
@@ -111,4 +146,38 @@ def normalize_weather_result(result):
         "temperature": value,
         "unit": unit.strip(),
         "sources": [source.strip() for source in sources],
+
     }
+
+# 校验并整理城市候选，不自动选择地点
+def normalize_city_candidates(candidates):
+    if not isinstance(candidates, list):
+        raise ValueError("城市候选必须是列表。")
+
+    results = []
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("城市候选格式错误。")
+
+        # 新建字典，只保留名称和行政区划
+        item = {}
+        for field in ["name", "country", "adm1", "adm2"]:
+            value = candidate.get(field, "")
+
+            if not isinstance(value, str):
+                raise ValueError("地点名称和行政区划必须是文字。")
+
+            item[field] = value.strip()
+
+        if not item["name"]:
+            raise ValueError("候选地点缺少名称。")
+
+        # 复用已有函数，检查坐标字段、数字格式和范围
+        item["location"] = weather_service.city_to_coordinates(
+            candidate
+        )
+
+        results.append(item)
+
+    return results

@@ -252,6 +252,20 @@ def get_current_weather(location):
     # 返回解析后的数据，交给调用方决定如何使用
     return fetch_weather(request)
 
+# 供程序调用的城市搜索入口，不询问用户选择
+def search_city_candidates(city_name):
+    # 先检查参数，非法输入不读取配置或发送请求
+    if not isinstance(city_name, str) or not city_name.strip():
+        raise ValueError("城市名称必须是非空字符串。")
+
+    city_name = city_name.strip()
+
+    # 配置由程序读取，不要求模型提供密钥
+    api_key, api_host = load_weather_config()
+
+    # 复用已有搜索函数，返回所有候选，不自动选择
+    return lookup_city(api_key, api_host, city_name)
+
 # 4. 天气查询主流程，供独立运行或统一菜单调用
 def main():
     try:
