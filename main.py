@@ -6,6 +6,8 @@ import travel_assistant
 import budget_agent
 # 导入天气模块；导入时不会自动查询
 import weather_service
+# 导入时不启动对话
+import agent_chat
 
 # 1. 读取并展示本地保存的最新预算，不调用API
 def show_latest_budget():
@@ -100,9 +102,10 @@ def main():
         print("2. 旅游预算分配与校验")
         print("3. 查看最新预算（不调用API）")
         print("4. 实时天气查询（调用天气API）")
+        print("5. Agent工具对话（可能调用模型与天气API）")
         print("0. 退出程序")
 
-        choice = input("请选择功能（1/2/3/4/0）：").strip()
+        choice = input("请选择功能（1/2/3/4/5/0）：").strip()
 
         if choice == "0":
             print("旅游助手已关闭。")
@@ -121,8 +124,12 @@ def main():
                 # 调用天气主流程，完成后继续显示菜单
                 weather_service.main()
 
+            elif choice == "5":
+                # Agent退出后，回到外层菜单循环
+                agent_chat.main()
+
             else:
-                print("选项无效，请输入1、2、3、4或0。")
+                print("选项无效，请输入1、2、3、4、5或0。")
 
         except APIError:
             print("API请求失败，请检查网络、余额、密钥权限和模型ID。")

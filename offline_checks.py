@@ -228,24 +228,32 @@ class OfflineChecks(unittest.TestCase):
                     self.assertNotIn("===== 最新保存的预算 =====", read_latest_output())
 
     def test_menu_dispatch_and_return(self):
-        # 收集菜单输出，避免测试时反复打印菜单
+        # 所有功能入口均使用模拟函数，不调用真实API
         output = io.StringIO()
 
-        # 模拟依次选择无效选项、四个功能，最后退出
-        # 各功能都被临时替换，不会真正聊天、生成预算或查询天气
-        with patch("builtins.input", side_effect=["9", "1", "2", "3", "4", "0"]), \
-                patch.object(chat, "main") as chat_call, \
-                patch.object(budget, "main") as budget_call, \
-                patch.object(menu, "show_latest_budget") as view_call, \
-                patch.object(menu.weather_service, "main") as weather_call, \
-                contextlib.redirect_stdout(output):
+        with (
+            patch(
+                "builtins.input",
+                side_effect=["9", "1", "2", "3", "4", "5", "0"],
+            ),
+            patch.object(chat, "main") as chat_call,
+            patch.object(budget, "main") as budget_call,
+            patch.object(menu, "show_latest_budget") as view_call,
+            patch.object(
+                menu.weather_service, "main"
+            ) as weather_call,
+            patch.object(
+                menu.agent_chat, "main"
+            ) as agent_call,
+            contextlib.redirect_stdout(output),
+        ):
             menu.main()
 
-        # 检查每个功能是否恰好调用一次
         chat_call.assert_called_once()
         budget_call.assert_called_once()
         view_call.assert_called_once()
         weather_call.assert_called_once()
+        agent_call.assert_called_once()
 
         self.assertIn("选项无效", output.getvalue())
         self.assertIn("旅游助手已关闭", output.getvalue())
