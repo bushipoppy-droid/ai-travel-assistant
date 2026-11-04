@@ -354,7 +354,10 @@ def main():
             },
         ]
 
-        print("旅游Agent已启动，输入“退出”结束。")
+        # 初始历史只有系统规则，作为新对话的起点
+        initial_messages = list(messages)
+
+        print("旅游Agent已启动，输入“退出”结束，输入“清空对话”重新开始。")
 
         while True:
             question = input("\n你：").strip()
@@ -363,8 +366,14 @@ def main():
                 print("对话结束。")
                 break
 
+            if question == "清空对话":
+                # 恢复系统规则，移除本次运行中保存的旧对话和候选
+                messages = list(initial_messages)
+                print("对话已清空，可以重新开始。")
+                continue
+
             if not question:
-                print("请输入问题，或输入“退出”。")
+                print("请输入问题，或输入“清空对话”“退出”。")
                 continue
 
             # 本轮先使用临时列表，失败时不保存本轮用户问题

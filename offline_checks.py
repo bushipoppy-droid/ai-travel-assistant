@@ -1489,5 +1489,84 @@ class OfflineChecks(unittest.TestCase):
         self.assertEqual(json.loads(sent[-1]["content"]), {
             "error": "查询坐标不属于候选列表，请确认地点。"
         })
+    # 检查清空对话后只保留系统规则，不再携带旧候选
+    def test_agent_clear_conversation(self):
+        received = []
+        output = io.StringIO()
+
+        def fake_turn(client, messages):
+            received.append(copy.deepcopy(messages))
+
+            if messages[-1]["content"] == "搜索北京":
+                # 模拟第一轮留下城市搜索记录
+                messages.extend([
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "city_before_clear",
+                            "function": {
+                                "name": "search_city_candidates"
+                            },
+                        }],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "city_before_clear",
+                        "content": json.dumps({
+                            "candidates": [{
+                                "name": "北京",
+                                "location": "116.41,39.92",
+                            }]
+                        }),
+                    },
+                ])
+
+            messages.append({
+                "role": "assistant",
+                "content": "模拟回复",
+            })
+            return "模拟回复"
+
+        with (
+            patch.dict(sys.modules, {"openai": fake_sdk}),
+            patch.object(fake_sdk, "OpenAI") as mock_client,
+            patch.dict(
+                os.environ,
+                {"SILICONFLOW_API_KEY": "fake-key"},
+            ),
+            patch(
+                "builtins.input",
+                side_effect=[
+                    "搜索北京",
+                    "清空对话",
+                    "清空对话",
+                    "新问题",
+                    "退出",
+                ],
+            ),
+            patch.object(
+                agent_chat, "run_agent_turn",
+                side_effect=fake_turn,
+            ) as mock_turn,
+            contextlib.redirect_stdout(output),
+        ):
+            agent_chat.main()
+
+        # 两次清空和退出都不进入轮次处理，也不重建客户端
+        mock_client.assert_called_once()
+        self.assertEqual(mock_turn.call_count, 2)
+
+        # 清空后，新一轮只有原系统规则和新问题
+        self.assertEqual(received[1], [
+            received[0][0],
+            {"role": "user", "content": "新问题"},
+        ])
+        self.assertIsNone(
+            agent_chat.get_latest_city_candidates(received[1])
+        )
+        self.assertEqual(
+            output.getvalue().count("对话已清空，可以重新开始。"),
+            2,
+        )
 if __name__ == "__main__":
     unittest.main(verbosity=2)
