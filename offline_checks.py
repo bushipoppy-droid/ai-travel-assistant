@@ -552,21 +552,39 @@ class OfflineChecks(unittest.TestCase):
 
                 mock_config.assert_not_called()
                 mock_fetch.assert_not_called()
-    # 检查JSON参数能够正确传给天气函数
+
+    # 检查参数传递，并确认只返回整理后的天气字段
     def test_weather_tool_json_success(self):
-        sample = {"test": "模拟天气结果"}
+        sample = {
+            "condition": {"text": "阴"},
+            "temperature": {"value": 9.06, "unit": "°C"},
+            "metadata": {
+                "attributions": [
+                    "https://developer.qweather.com/attribution.html"
+                ]
+            },
+            "wind": {"direction": {"compass": "sse"}},
+        }
 
         with patch.object(
-            weather_tools.weather_service,
-            "get_current_weather",
-            return_value=sample,
+                weather_tools.weather_service,
+                "get_current_weather",
+                return_value=sample,
         ) as mock_weather:
             result = weather_tools.execute_weather_tool_json(
                 "get_current_weather",
                 '{"location": "116.41,39.92"}',
             )
 
-        self.assertEqual(result, sample)
+        # 完整比较，确认风向等多余字段没有进入结果
+        self.assertEqual(result, {
+            "weather": "阴",
+            "temperature": 9.06,
+            "unit": "°C",
+            "sources": [
+                "https://developer.qweather.com/attribution.html"
+            ],
+        })
         mock_weather.assert_called_once_with("116.41,39.92")
 
     # 检查错误调用被拒绝，且没有执行天气函数
@@ -642,19 +660,28 @@ class OfflineChecks(unittest.TestCase):
             "content": "查询116.41,39.92的当前天气。",
         }]
 
-        # 保留真实流程，只替换工具执行，避免联网
+        # 模拟接口原始数据，额外包含不需要交给模型的风向
+        sample = {
+            "condition": {"text": "晴"},
+            "temperature": {"value": 20.5, "unit": "°C"},
+            "metadata": {
+                "attributions": [
+                    "https://developer.qweather.com/attribution.html"
+                ]
+            },
+            "wind": {"direction": {"compass": "sse"}},
+        }
+
+        # 只替换天气查询，保留工具校验与结果整理
         with patch.object(
-            agent_chat,
-            "execute_weather_tool_json",
-            return_value={"condition": {"text": "晴"}},
-        ) as mock_tool:
+                weather_tools.weather_service,
+                "get_current_weather",
+                return_value=sample,
+        ) as mock_weather:
             answer = agent_chat.run_agent_turn(client, messages)
 
         self.assertEqual(answer, "该地点当前晴，20.5℃。")
-        mock_tool.assert_called_once_with(
-            "get_current_weather",
-            '{"location": "116.41,39.92"}',
-        )
+        mock_weather.assert_called_once_with("116.41,39.92")
 
         calls = client.chat.completions.create.call_args_list
         self.assertEqual(len(calls), 2)
@@ -667,6 +694,16 @@ class OfflineChecks(unittest.TestCase):
             ["user", "assistant", "tool"],
         )
         self.assertEqual(sent[-1]["tool_call_id"], "call_test_1")
+        # 检查第二次模型请求收到的工具结果
+        tool_result = json.loads(sent[-1]["content"])
+        self.assertEqual(tool_result, {
+            "weather": "晴",
+            "temperature": 20.5,
+            "unit": "°C",
+            "sources": [
+                "https://developer.qweather.com/attribution.html"
+            ],
+        })
         self.assertEqual(len(messages), 1)
     # 普通聊天：模型直接回答，不执行工具，也不请求第二次
     def test_agent_direct_reply(self):
@@ -719,5 +756,49 @@ class OfflineChecks(unittest.TestCase):
 
         mock_reply.assert_called_once()
         mock_tool.assert_not_called()
+    # 检查异常温度被拒绝，并转换成可回传的工具错误
+    def test_agent_rejects_invalid_temperature(self):
+        tool_call = types.SimpleNamespace(
+            id="call_invalid_temperature",
+            function=types.SimpleNamespace(
+                name="get_current_weather",
+                arguments='{"location": "116.41,39.92"}',
+            ),
+        )
+
+        # 布尔值、文字、缺失值、非有限数字都不应作为温度
+        cases = [True, "20.5", None, float("nan"), float("inf")]
+
+        for value in cases:
+            with self.subTest(temperature=value):
+                sample = {
+                    "condition": {"text": "晴"},
+                    "temperature": {"value": value, "unit": "°C"},
+                    "metadata": {
+                        "attributions": [
+                            "https://developer.qweather.com/attribution.html"
+                        ]
+                    },
+                }
+
+                # 只模拟天气查询，保留参数与响应校验的真实逻辑
+                with patch.object(
+                    weather_tools.weather_service,
+                    "get_current_weather",
+                    return_value=sample,
+                ) as mock_weather:
+                    message = agent_chat.execute_tool_call(tool_call)
+
+                result = json.loads(message["content"])
+
+                self.assertEqual(
+                    result,
+                    {"error": "温度必须是有限数字。"},
+                )
+                self.assertEqual(
+                    message["tool_call_id"],
+                    "call_invalid_temperature",
+                )
+                mock_weather.assert_called_once_with("116.41,39.92")
 if __name__ == "__main__":
     unittest.main(verbosity=2)
